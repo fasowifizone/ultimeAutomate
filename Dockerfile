@@ -1,6 +1,6 @@
 FROM node:18-slim
 
-# Installer Chromium et dépendances pour Puppeteer
+# Installer Chromium + dépendances pour Puppeteer
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-ipafont-gothic \
@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
+# Indiquer à Puppeteer où trouver Chromium
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
@@ -21,6 +22,6 @@ RUN npm ci --only=production
 
 COPY . .
 
-EXPOSE 3001
+EXPOSE 3000
 
 CMD ["node", "server.js"]
