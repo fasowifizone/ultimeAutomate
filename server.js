@@ -1,90 +1,184 @@
-require('dotenv').config();
+// server.js - Serveur complet PALGA TOOLS + WhatsApp API
 const express = require('express');
 const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
-const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Pool } = require('pg');
-const Redis = require('ioredis');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 
-// ========== INITIALISATION ==========
 const app = express();
-app.use(express.json());
-app.use(cors({ origin: true, credentials: true })); // Autorise tous les domaines
-app.use(express.urlencoded({ extended: true }));
+const PORT = process.env.PORT || 3000;
 
-// Base de données PostgreSQL
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+// ============ CONFIGURATION SUPABASE (codée en dur) ============
+const supabaseUrl = 'https://nuiohpzybysaqawdqvvl.supabase.co';
+const supabaseKey = 'sb_publishable_02wVBCiyI9-1PV8SXY3Grw_9_dWF-fi';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Clé JWT pour webhooks et sessions (fixe pour l'exemple)
+const JWT_SECRET = 'PALGA_WHATSAPP_SECRET_KEY_2024';
+
+// ============ MIDDLEWARE ============
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+app.use(express.static('public'));
+
+// Limiteur de requêtes pour les envois WhatsApp
+const messageLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: 'Trop de messages, veuillez patienter.'
 });
 
-// Redis pour files d'attente et sessions (optionnel mais recommandé)
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+// ============ INITIALISATION DE LA BASE DE DONNÉES ============
+async function initDatabase() {
+  // Tables existantes (votre code)
+  await supabase.rpc('exec_sql', {
+    sql: `
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE NOT NULL,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        email TEXT,
+        whatsapp TEXT,
+        credit FLOAT DEFAULT 0,
+        is_admin INTEGER DEFAULT 0,
+        plan TEXT DEFAULT 'free',
+        subscription_ends_at TIMESTAMP,
+        webhook_url TEXT,
+        webhook_secret TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP
+      );
+      
+      CREATE TABLE IF NOT EXISTS services (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        price FLOAT NOT NULL,
+        commands TEXT,
+        is_active INTEGER DEFAULT 1
+      );
+      
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        amount FLOAT NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      CREATE TABLE IF NOT EXISTS recharge_transactions (
+        id SERIAL PRIMARY KEY,
+        transaction_id TEXT UNIQUE NOT NULL,
+        user_id TEXT NOT NULL,
+        phone_number TEXT NOT NULL,
+        amount_requested INTEGER NOT NULL,
+        credits_amount INTEGER NOT NULL,
+        status TEXT DEFAULT 'pending',
+        transaction_message TEXT,
+        verified_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      -- NOUVELLES TABLES POUR WHATSAPP
+      CREATE TABLE IF NOT EXISTS whatsapp_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        phone_number TEXT,
+        status TEXT DEFAULT 'initializing',
+        qr_code TEXT,
+        session_data JSONB,
+        last_seen TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS whatsapp_messages (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        device_id UUID REFERENCES whatsapp_devices(id),
+        user_id TEXT REFERENCES users(user_id),
+        direction TEXT CHECK (direction IN ('outgoing', 'incoming')),
+        to_number TEXT,
+        from_number TEXT,
+        message TEXT,
+        message_id TEXT,
+        status TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS plans (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        price_credits INTEGER NOT NULL,
+        messages_per_month INTEGER NOT NULL,
+        devices_allowed INTEGER NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE
+      );
+      
+      INSERT INTO plans (name, price_credits, messages_per_month, devices_allowed)
+      VALUES ('free', 0, 100, 1), ('basic', 50, 2000, 2), ('pro', 150, 10000, 5)
+      ON CONFLICT (name) DO NOTHING;
+    `
+  });
 
-// ========== MODÈLES SIMPLIFIÉS (sans ORM) ==========
-const initDB = async () => {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      email VARCHAR(255) UNIQUE NOT NULL,
-      password VARCHAR(255) NOT NULL,
-      company_name VARCHAR(255),
-      subscription_status VARCHAR(50) DEFAULT 'trial',
-      trial_ends_at TIMESTAMP DEFAULT NOW() + INTERVAL '7 days',
-      subscription_ends_at TIMESTAMP,
-      max_devices INT DEFAULT 1,
-      webhook_url TEXT,
-      webhook_secret VARCHAR(255),
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    
-    CREATE TABLE IF NOT EXISTS devices (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-      phone_number VARCHAR(20),
-      session_data JSONB,
-      status VARCHAR(50) DEFAULT 'initializing',
-      qr_code TEXT,
-      last_seen TIMESTAMP,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID REFERENCES users(id),
-      plan VARCHAR(50),
-      price DECIMAL(10,2),
-      stripe_subscription_id VARCHAR(255),
-      status VARCHAR(50),
-      start_date TIMESTAMP,
-      end_date TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS message_logs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      device_id UUID REFERENCES devices(id),
-      user_id UUID REFERENCES users(id),
-      to_number VARCHAR(20),
-      message TEXT,
-      status VARCHAR(50),
-      message_id VARCHAR(255),
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-  console.log('✅ Database initialized');
-};
-initDB();
+  await createDefaultAdmin();
+  await createDefaultDemo();
+  await createDefaultServices();
+  console.log('✅ Base de données initialisée');
+}
 
-// ========== STOCKAGE DES CLIENTS WHATSAPP (en mémoire) ==========
+async function createDefaultAdmin() {
+  const adminId = generateUserId();
+  const hashedAdminPw = bcrypt.hashSync('Admin123', 10);
+  const { data: existing } = await supabase.from('users').select('*').eq('username', 'administrateur').maybeSingle();
+  if (!existing) {
+    await supabase.from('users').insert([{
+      user_id: adminId, username: 'administrateur', password: hashedAdminPw,
+      email: 'admin@palga.com', credit: 1000, is_admin: 1, plan: 'pro',
+      subscription_ends_at: new Date(Date.now() + 365 * 24 * 3600 * 1000)
+    }]);
+    console.log('✅ Admin créé');
+  }
+}
+
+async function createDefaultDemo() {
+  const demoId = generateUserId();
+  const hashedDemoPw = bcrypt.hashSync('Demo123', 10);
+  const { data: existing } = await supabase.from('users').select('*').eq('username', 'DEMO').maybeSingle();
+  if (!existing) {
+    await supabase.from('users').insert([{
+      user_id: demoId, username: 'DEMO', password: hashedDemoPw,
+      email: 'demo@palga.com', credit: 100, is_admin: 0, plan: 'free'
+    }]);
+    console.log('✅ Utilisateur DEMO créé');
+  }
+}
+
+async function createDefaultServices() {
+  const services = [
+    { name: 'FRP Bypass Standard', description: 'Déblocage compte Google', price: 10, commands: '["adb shell content insert --uri content://settings/secure --bind name:s:user_setup_complete --bind value:s:1"]', is_active: 1 },
+    { name: 'FRP Bypass Avancé', description: 'Pour Samsung/Huawei', price: 15, commands: '["adb shell settings put global setup_wizard_has_run 1"]', is_active: 1 },
+    { name: 'MDM Removal', description: 'Suppression MDM complet', price: 20, commands: '["adb shell pm uninstall -k --user 0 com.android.mdm"]', is_active: 0 },
+    { name: 'Web Bypass', description: 'Ouverture du clavier d\'appel', price: 10, commands: '["open_dialer"]', is_active: 1 }
+  ];
+  for (const service of services) {
+    const { data: existing } = await supabase.from('services').select('*').eq('name', service.name).maybeSingle();
+    if (!existing) await supabase.from('services').insert([service]);
+  }
+}
+
+function generateUserId() {
+  return 'PALGA' + crypto.randomBytes(4).toString('hex').toUpperCase();
+}
+
+// ============ STOCKAGE DES SESSIONS WHATSAPP ============
 const whatsappInstances = new Map();
 
-// ========== SERVICE WHATSAPP ==========
+// ============ SERVICE WHATSAPP ============
 class WhatsAppService {
   constructor(deviceId, userId) {
     this.deviceId = deviceId;
@@ -95,312 +189,375 @@ class WhatsAppService {
 
   async initialize() {
     this.client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: `device_${this.deviceId}`,
-        dataPath: `./sessions/${this.userId}`
-      }),
-      puppeteer: {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu'
-        ]
-      }
+      authStrategy: new LocalAuth({ clientId: `device_${this.deviceId}`, dataPath: `./sessions/${this.userId}` }),
+      puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
     });
 
     this.client.on('qr', async (qr) => {
       const qrImage = await QRCode.toDataURL(qr);
-      await pool.query('UPDATE devices SET qr_code = $1, status = $2 WHERE id = $3', [qrImage, 'awaiting_scan', this.deviceId]);
-      console.log(`📱 QR code generated for device ${this.deviceId}`);
+      await supabase.from('whatsapp_devices').update({ qr_code: qrImage, status: 'awaiting_scan' }).eq('id', this.deviceId);
+      console.log(`📱 QR code pour device ${this.deviceId}`);
     });
 
     this.client.on('ready', async () => {
       this.isReady = true;
       const info = this.client.info;
-      await pool.query('UPDATE devices SET status = $1, phone_number = $2 WHERE id = $3', ['connected', info.wid.user, this.deviceId]);
-      console.log(`✅ WhatsApp ready for device ${this.deviceId} (${info.wid.user})`);
+      await supabase.from('whatsapp_devices').update({ status: 'connected', phone_number: info.wid.user, last_seen: new Date() }).eq('id', this.deviceId);
+      console.log(`✅ WhatsApp prêt pour ${info.wid.user}`);
     });
 
     this.client.on('message', async (message) => {
       await this.handleIncomingMessage(message);
     });
 
-    this.client.on('disconnected', async (reason) => {
+    this.client.on('disconnected', async () => {
       this.isReady = false;
-      await pool.query('UPDATE devices SET status = $1 WHERE id = $2', ['disconnected', this.deviceId]);
-      console.log(`⚠️ Device ${this.deviceId} disconnected: ${reason}`);
-      // Tentative de reconnexion automatique après 5 secondes
-      setTimeout(() => this.initialize(), 5000);
+      await supabase.from('whatsapp_devices').update({ status: 'disconnected' }).eq('id', this.deviceId);
+      setTimeout(() => this.initialize(), 10000);
     });
 
     await this.client.initialize();
   }
 
   async handleIncomingMessage(message) {
+    const device = await supabase.from('whatsapp_devices').select('user_id').eq('id', this.deviceId).single();
     const webhookData = {
-      type: 'message',
-      deviceId: this.deviceId,
-      userId: this.userId,
-      from: message.from,
-      body: message.body,
-      timestamp: message.timestamp,
-      hasMedia: message.hasMedia,
+      type: 'message', deviceId: this.deviceId, userId: device.data.user_id,
+      from: message.from, body: message.body, timestamp: message.timestamp,
       messageId: message.id.id
     };
-    // Mettre dans queue Redis pour traitement asynchrone
-    await redis.lpush('webhook_queue', JSON.stringify(webhookData));
+    await supabase.from('whatsapp_messages').insert([{
+      device_id: this.deviceId, user_id: device.data.user_id, direction: 'incoming',
+      from_number: message.from, message: message.body, message_id: message.id.id, status: 'received'
+    }]);
     await this.processWebhook(webhookData);
   }
 
   async processWebhook(data) {
-    const result = await pool.query('SELECT webhook_url, webhook_secret FROM users WHERE id = $1', [this.userId]);
-    const user = result.rows[0];
-    if (user && user.webhook_url) {
+    const { data: user } = await supabase.from('users').select('webhook_url, webhook_secret').eq('user_id', data.userId).single();
+    if (user?.webhook_url) {
+      const signature = jwt.sign(data, user.webhook_secret || JWT_SECRET);
       try {
-        const signature = jwt.sign(data, user.webhook_secret);
-        await axios.post(user.webhook_url, data, {
-          headers: { 'X-Webhook-Signature': signature }
-        });
-      } catch (err) {
-        console.error('Webhook failed, queuing retry', err.message);
-        await redis.lpush('webhook_retry', JSON.stringify({ ...data, retry: 0 }));
-      }
+        await axios.post(user.webhook_url, data, { headers: { 'X-Webhook-Signature': signature }, timeout: 5000 });
+      } catch (err) { console.error('Webhook échoué', err.message); }
     }
   }
 
-  async sendMessage(to, text, options = {}) {
-    if (!this.isReady) throw new Error('WhatsApp not ready');
+  async sendMessage(to, text) {
+    if (!this.isReady) throw new Error('WhatsApp non prêt');
     const chatId = to.includes('@c.us') ? to : `${to}@c.us`;
-    const msg = await this.client.sendMessage(chatId, text, options);
-    await pool.query(
-      'INSERT INTO message_logs (device_id, user_id, to_number, message, status, message_id) VALUES ($1, $2, $3, $4, $5, $6)',
-      [this.deviceId, this.userId, to, text, 'sent', msg.id.id]
-    );
+    const msg = await this.client.sendMessage(chatId, text);
+    await supabase.from('whatsapp_messages').insert([{
+      device_id: this.deviceId, user_id: this.userId, direction: 'outgoing',
+      to_number: to, message: text, message_id: msg.id.id, status: 'sent'
+    }]);
     return msg;
-  }
-
-  async sendMedia(to, mediaUrl, caption = '') {
-    const media = await MessageMedia.fromUrl(mediaUrl);
-    return this.sendMessage(to, media, { caption });
   }
 }
 
-// ========== MIDDLEWARES ==========
-const authenticate = async (req, res, next) => {
+// ============ MIDDLEWARE AUTHENTIFICATION ============
+async function authenticate(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
+  if (!token) return res.status(401).json({ error: 'Token manquant' });
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const result = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.userId]);
-    if (result.rows.length === 0) throw new Error('User not found');
-    req.user = result.rows[0];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { data: user, error } = await supabase.from('users').select('*').eq('user_id', decoded.userId).single();
+    if (error || !user) throw new Error();
+    req.user = user;
     next();
   } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'Token invalide' });
   }
-};
+}
 
-const rateLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100,
-  message: 'Too many requests, please try again later.'
+// Vérification des droits d'envoi (crédits ou abonnement)
+async function checkMessageQuota(userId) {
+  const { data: user } = await supabase.from('users').select('credit, plan, subscription_ends_at').eq('user_id', userId).single();
+  const currentMonth = new Date();
+  const startOfMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
+  const { count: messagesSent } = await supabase.from('whatsapp_messages')
+    .select('*', { count: 'exact', head: true })
+    .eq('user_id', userId).eq('direction', 'outgoing')
+    .gte('created_at', startOfMonth.toISOString());
+
+  // Chercher le plan
+  const { data: plan } = await supabase.from('plans').select('messages_per_month').eq('name', user.plan).single();
+  const monthlyLimit = plan?.messages_per_month || 100;
+
+  // Si abonnement actif (subscription_ends_at > now)
+  const hasActiveSub = user.subscription_ends_at && new Date(user.subscription_ends_at) > new Date();
+  if (hasActiveSub) {
+    if (messagesSent >= monthlyLimit) return { allowed: false, reason: 'Limite mensuelle atteinte' };
+    return { allowed: true, useCredits: false };
+  } else {
+    // Mode pay-as-you-go : 1 crédit par message
+    if (user.credit < 1) return { allowed: false, reason: 'Crédits insuffisants' };
+    return { allowed: true, useCredits: true };
+  }
+}
+
+// ============ ROUTES EXISTANTES (PALGA TOOLS) ============
+app.get('/', (req, res) => res.json({ status: 'online', service: 'PALGA TOOLS + WhatsApp API' }));
+
+app.post('/api/register', async (req, res) => {
+  const { username, password, email, whatsapp } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Nom d\'utilisateur et mot de passe requis' });
+  const { data: existing } = await supabase.from('users').select('username').eq('username', username).maybeSingle();
+  if (existing) return res.status(400).json({ error: 'Nom d\'utilisateur déjà pris' });
+  const user_id = generateUserId();
+  const hashedPassword = bcrypt.hashSync(password, 10);
+  const { error } = await supabase.from('users').insert([{ user_id, username, password: hashedPassword, email, whatsapp, credit: 0 }]);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, user_id, username });
 });
 
-// ========== ROUTES ==========
-// 1. Auth
-app.post('/api/auth/register', async (req, res) => {
-  const { email, password, companyName } = req.body;
-  const hashed = await bcrypt.hash(password, 10);
-  try {
-    const result = await pool.query(
-      'INSERT INTO users (email, password, company_name) VALUES ($1, $2, $3) RETURNING id, email, company_name, subscription_status, trial_ends_at, max_devices',
-      [email, hashed, companyName]
-    );
-    const user = result.rows[0];
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user });
-  } catch (err) {
-    res.status(400).json({ error: 'Email already exists' });
-  }
+app.post('/api/login', async (req, res) => {
+  const { identifier, password } = req.body;
+  const { data: user, error } = await supabase.from('users').select('*').or(`username.eq.${identifier},user_id.eq.${identifier}`).maybeSingle();
+  if (error || !user || !bcrypt.compareSync(password, user.password))
+    return res.status(401).json({ error: 'Identifiants incorrects' });
+  await supabase.from('users').update({ last_login: new Date() }).eq('user_id', user.user_id);
+  const token = jwt.sign({ userId: user.user_id }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ success: true, token, user_id: user.user_id, username: user.username, email: user.email, whatsapp: user.whatsapp, credit: user.credit, is_admin: user.is_admin });
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-  const user = result.rows[0];
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { id: user.id, email, company_name: user.company_name, subscription_status: user.subscription_status, max_devices: user.max_devices } });
+app.get('/api/user/:userId/credit', async (req, res) => {
+  const { userId } = req.params;
+  const { data: user } = await supabase.from('users').select('user_id, username, credit').or(`user_id.eq.${userId},username.eq.${userId}`).maybeSingle();
+  if (!user) return res.status(404).json({ error: 'Utilisateur non trouvé' });
+  res.json(user);
 });
 
-// 2. WhatsApp Devices
-app.post('/api/devices/connect', authenticate, async (req, res) => {
+app.get('/api/services', async (req, res) => {
+  const { data: services } = await supabase.from('services').select('*').eq('is_active', 1);
+  res.json(services || []);
+});
+
+// Vérification de transaction (inchangée)
+function verifyTransactionMessage(message, requestedAmount, phoneNumber) {
+  const errors = [];
+  if (!message.includes('Votre paiement')) errors.push('Message de confirmation invalide');
+  if (!message.includes('ISSIAKA BOKOUM')) errors.push('Nom du bénéficiaire incorrect');
+  const amountMatch = message.match(/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\s*FCFA/);
+  let paidAmount = null;
+  if (amountMatch) paidAmount = parseFloat(amountMatch[1].replace(/[.,]/g, '')) / 100;
+  if (!paidAmount) errors.push('Montant non trouvé');
+  const expectedAmount = requestedAmount * 100;
+  if (paidAmount && Math.abs(paidAmount - expectedAmount) > 1) errors.push(`Montant incorrect: attendu ${expectedAmount} FCFA, reçu ${paidAmount} FCFA`);
+  const transIdMatch = message.match(/Trans id:\s*([A-Z0-9.]+)/i);
+  const transId = transIdMatch ? transIdMatch[1] : null;
+  if (!transId) errors.push('Transaction ID non trouvé');
+  if (transId && !transId.startsWith('MP')) errors.push('Format de transaction ID invalide');
+  const datePattern = /MP(\d{2})(\d{2})(\d{2})\.(\d{2})(\d{2})/;
+  const dateMatch = transId?.match(datePattern);
+  if (dateMatch) {
+    const year = 2000 + parseInt(dateMatch[1]), month = parseInt(dateMatch[2]), day = parseInt(dateMatch[3]), hour = parseInt(dateMatch[4]), minute = parseInt(dateMatch[5]);
+    const transactionDate = new Date(year, month-1, day, hour, minute);
+    const now = new Date();
+    if (transactionDate.toDateString() !== now.toDateString()) errors.push('Transaction pas du jour');
+    const timeDiff = (now - transactionDate) / 60000;
+    if (timeDiff > 2) errors.push(`Transaction trop ancienne (${Math.floor(timeDiff)} min)`);
+  }
+  if (errors.length) return { valid: false, errors };
+  return { valid: true, data: { transId, paidAmount, transactionDate: new Date() } };
+}
+
+app.post('/api/verify-recharge', async (req, res) => {
+  const { user_id, credits_amount, phone_number, transaction_message } = req.body;
+  if (!user_id || !credits_amount || !phone_number || !transaction_message)
+    return res.status(400).json({ error: 'Tous les champs sont requis' });
+  if (![10,20].includes(credits_amount)) return res.status(400).json({ error: 'Crédits invalides (10 ou 20)' });
+  const { data: user } = await supabase.from('users').select('user_id, credit').or(`user_id.eq.${user_id},username.eq.${user_id}`).maybeSingle();
+  if (!user) return res.status(404).json({ error: 'Utilisateur non trouvé' });
+  const { data: existing } = await supabase.from('recharge_transactions').select('transaction_id').eq('transaction_id', transaction_message.substring(0,100)).maybeSingle();
+  if (existing) return res.status(400).json({ error: 'Transaction déjà utilisée' });
+  const verification = verifyTransactionMessage(transaction_message, credits_amount, phone_number);
+  if (!verification.valid) {
+    await supabase.from('recharge_transactions').insert([{ transaction_id: transaction_message.substring(0,100), user_id: user.user_id, phone_number, amount_requested: credits_amount, credits_amount, status: 'fraud_attempt', transaction_message: transaction_message.substring(0,500) }]);
+    return res.status(400).json({ error: verification.errors.join(', ') });
+  }
+  const newCredit = user.credit + credits_amount;
+  await supabase.from('users').update({ credit: newCredit }).eq('user_id', user.user_id);
+  await supabase.from('recharge_transactions').insert([{ transaction_id: verification.data.transId, user_id: user.user_id, phone_number, amount_requested: credits_amount, credits_amount, status: 'completed', transaction_message: transaction_message.substring(0,500), verified_at: new Date() }]);
+  await supabase.from('transactions').insert([{ user_id: user.user_id, type: 'recharge', amount: credits_amount, description: `Recharge ${credits_amount} crédits - ${verification.data.transId}` }]);
+  res.json({ success: true, new_credit: newCredit, added_credits: credits_amount, transaction_id: verification.data.transId });
+});
+
+app.get('/api/check-transaction/:transId', async (req, res) => {
+  const { transId } = req.params;
+  const { data: tx } = await supabase.from('recharge_transactions').select('*').eq('transaction_id', transId).maybeSingle();
+  res.json(tx ? { exists: true, status: tx.status, user_id: tx.user_id, amount: tx.credits_amount } : { exists: false });
+});
+
+app.post('/api/service/frp-bypass', async (req, res) => {
+  const { user_id, service_id } = req.body;
+  const { data: service } = await supabase.from('services').select('*').eq('id', service_id).eq('is_active',1).maybeSingle();
+  if (!service) return res.status(404).json({ error: 'Service non trouvé' });
+  const { data: user } = await supabase.from('users').select('credit').eq('user_id', user_id).maybeSingle();
+  if (!user || user.credit < service.price) return res.status(400).json({ error: `Crédits insuffisants, besoin de ${service.price}` });
+  const newCredit = user.credit - service.price;
+  await supabase.from('users').update({ credit: newCredit }).eq('user_id', user_id);
+  await supabase.from('transactions').insert([{ user_id, type: 'service', amount: service.price, description: service.name }]);
+  let commands = [];
+  try { commands = JSON.parse(service.commands); } catch(e) { commands = [service.commands]; }
+  res.json({ success: true, remaining_credit: newCredit, commands, service_name: service.name });
+});
+
+app.post('/api/service/web-bypass', async (req, res) => {
+  const { user_id } = req.body;
+  const { data: user } = await supabase.from('users').select('credit').or(`user_id.eq.${user_id},username.eq.${user_id}`).maybeSingle();
+  if (!user || user.credit < 10) return res.status(400).json({ error: `Crédits insuffisants, besoin de 10` });
+  const newCredit = user.credit - 10;
+  await supabase.from('users').update({ credit: newCredit }).eq('user_id', user.user_id);
+  await supabase.from('transactions').insert([{ user_id: user.user_id, type: 'service', amount: 10, description: 'Web Bypass' }]);
+  res.json({ success: true, remaining_credit: newCredit, message: "Web Bypass effectué!", action: "open_dialer", intent_url: "tel:" });
+});
+
+// ============ ROUTES ADMIN (inchangées) ============
+app.get('/api/admin/users', async (req, res) => {
+  const { admin_id } = req.query;
+  const { data: admin } = await supabase.from('users').select('is_admin').eq('user_id', admin_id).maybeSingle();
+  if (!admin?.is_admin) return res.status(403).json({ error: 'Non autorisé' });
+  const { data: users } = await supabase.from('users').select('user_id, username, email, whatsapp, credit, is_admin, plan, subscription_ends_at, created_at, last_login').order('created_at', { ascending: false });
+  res.json(users || []);
+});
+
+app.post('/api/admin/add-credit', async (req, res) => {
+  const { admin_id, user_id, amount, description } = req.body;
+  const { data: admin } = await supabase.from('users').select('is_admin').eq('user_id', admin_id).maybeSingle();
+  if (!admin?.is_admin) return res.status(403).json({ error: 'Non autorisé' });
+  const { data: user } = await supabase.from('users').select('credit').eq('user_id', user_id).maybeSingle();
+  if (!user) return res.status(404).json({ error: 'Utilisateur non trouvé' });
+  const newCredit = user.credit + amount;
+  await supabase.from('users').update({ credit: newCredit }).eq('user_id', user_id);
+  await supabase.from('transactions').insert([{ user_id, type: 'admin_credit', amount, description: description || 'Ajout par admin' }]);
+  res.json({ success: true, new_credit: newCredit });
+});
+
+app.get('/api/admin/stats', async (req, res) => {
+  const { admin_id } = req.query;
+  const { data: admin } = await supabase.from('users').select('is_admin').eq('user_id', admin_id).maybeSingle();
+  if (!admin?.is_admin) return res.status(403).json({ error: 'Non autorisé' });
+  const { count: total_users } = await supabase.from('users').select('*', { count: 'exact', head: true });
+  const { data: creditData } = await supabase.from('users').select('credit');
+  const total_credit = creditData?.reduce((s,u) => s + (u.credit||0), 0) || 0;
+  const { count: total_transactions } = await supabase.from('transactions').select('*', { count: 'exact', head: true });
+  const { count: services_used } = await supabase.from('transactions').select('*', { count: 'exact', head: true }).eq('type', 'service');
+  const { count: fraud_attempts } = await supabase.from('recharge_transactions').select('*', { count: 'exact', head: true }).eq('status', 'fraud_attempt');
+  res.json({ total_users: total_users||0, total_credit, total_transactions: total_transactions||0, services_used: services_used||0, fraud_attempts: fraud_attempts||0 });
+});
+
+app.get('/api/admin/recharge-transactions', async (req, res) => {
+  const { admin_id } = req.query;
+  const { data: admin } = await supabase.from('users').select('is_admin').eq('user_id', admin_id).maybeSingle();
+  if (!admin?.is_admin) return res.status(403).json({ error: 'Non autorisé' });
+  const { data: tx } = await supabase.from('recharge_transactions').select('*').order('created_at', { ascending: false }).limit(100);
+  res.json(tx || []);
+});
+
+app.get('/api/user/:userId/transactions', async (req, res) => {
+  const { userId } = req.params;
+  const { data: tx } = await supabase.from('transactions').select('type, amount, description, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(50);
+  res.json(tx || []);
+});
+
+// ============ NOUVELLES ROUTES WHATSAPP ============
+app.get('/api/plans', async (req, res) => {
+  const { data: plans } = await supabase.from('plans').select('*').eq('is_active', true);
+  res.json(plans);
+});
+
+app.post('/api/subscribe', authenticate, async (req, res) => {
+  const { planName } = req.body; // 'basic' ou 'pro'
   const user = req.user;
-  const activeCount = await pool.query('SELECT COUNT(*) FROM devices WHERE user_id = $1 AND status = $2', [user.id, 'connected']);
-  if (parseInt(activeCount.rows[0].count) >= user.max_devices) {
-    return res.status(403).json({ error: 'Device limit reached. Upgrade your plan.' });
-  }
-  const deviceResult = await pool.query('INSERT INTO devices (user_id, status) VALUES ($1, $2) RETURNING id', [user.id, 'initializing']);
-  const deviceId = deviceResult.rows[0].id;
-  const waService = new WhatsAppService(deviceId, user.id);
-  whatsappInstances.set(deviceId, waService);
-  waService.initialize().catch(err => console.error('Init error', err));
-  res.json({ deviceId, message: 'Device initializing, QR code will appear soon.' });
+  const { data: plan } = await supabase.from('plans').select('*').eq('name', planName).eq('is_active', true).single();
+  if (!plan) return res.status(400).json({ error: 'Plan invalide' });
+  if (user.credit < plan.price_credits) return res.status(400).json({ error: `Crédits insuffisants, besoin de ${plan.price_credits}` });
+  const newCredit = user.credit - plan.price_credits;
+  const endDate = new Date();
+  endDate.setMonth(endDate.getMonth() + 1);
+  await supabase.from('users').update({ credit: newCredit, plan: planName, subscription_ends_at: endDate.toISOString() }).eq('user_id', user.user_id);
+  await supabase.from('transactions').insert([{ user_id: user.user_id, type: 'subscription', amount: plan.price_credits, description: `Abonnement ${plan.name} - 1 mois` }]);
+  res.json({ success: true, new_credit: newCredit, plan: planName, expires_at: endDate });
 });
 
-app.get('/api/devices', authenticate, async (req, res) => {
-  const result = await pool.query('SELECT id, phone_number, status, qr_code, last_seen FROM devices WHERE user_id = $1', [req.user.id]);
-  res.json(result.rows);
+// Connecter un appareil WhatsApp
+app.post('/api/whatsapp/connect', authenticate, async (req, res) => {
+  const user = req.user;
+  const { data: plan } = await supabase.from('plans').select('devices_allowed').eq('name', user.plan).single();
+  const maxDevices = plan?.devices_allowed || 1;
+  const { count: deviceCount } = await supabase.from('whatsapp_devices').select('*', { count: 'exact', head: true }).eq('user_id', user.user_id).eq('status', 'connected');
+  if (deviceCount >= maxDevices) return res.status(403).json({ error: `Limite de ${maxDevices} appareil(s) atteinte pour votre plan` });
+  const { data: newDevice, error } = await supabase.from('whatsapp_devices').insert([{ user_id: user.user_id, status: 'initializing' }]).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  const waService = new WhatsAppService(newDevice.id, user.user_id);
+  whatsappInstances.set(newDevice.id, waService);
+  waService.initialize().catch(err => console.error(err));
+  res.json({ deviceId: newDevice.id, message: 'Appareil en initialisation, récupérez le QR code' });
 });
 
-app.get('/api/devices/:deviceId/qr', authenticate, async (req, res) => {
-  const result = await pool.query('SELECT qr_code FROM devices WHERE id = $1 AND user_id = $2', [req.params.deviceId, req.user.id]);
-  if (result.rows.length === 0) return res.status(404).json({ error: 'Device not found' });
-  res.json({ qr: result.rows[0].qr_code });
+// Lister les appareils
+app.get('/api/whatsapp/devices', authenticate, async (req, res) => {
+  const { data: devices } = await supabase.from('whatsapp_devices').select('id, phone_number, status, qr_code, last_seen, created_at').eq('user_id', req.user.user_id);
+  res.json(devices || []);
 });
 
-app.post('/api/devices/:deviceId/send', authenticate, rateLimiter, async (req, res) => {
-  const { deviceId } = req.params;
-  const { to, message, type = 'text', mediaUrl } = req.body;
-  const deviceCheck = await pool.query('SELECT id FROM devices WHERE id = $1 AND user_id = $2 AND status = $3', [deviceId, req.user.id, 'connected']);
-  if (deviceCheck.rows.length === 0) return res.status(400).json({ error: 'Device not connected or not found' });
+// Récupérer QR code d'un appareil
+app.get('/api/whatsapp/devices/:deviceId/qr', authenticate, async (req, res) => {
+  const { data: device } = await supabase.from('whatsapp_devices').select('qr_code, status').eq('id', req.params.deviceId).eq('user_id', req.user.user_id).single();
+  if (!device) return res.status(404).json({ error: 'Appareil non trouvé' });
+  res.json({ qr: device.qr_code, status: device.status });
+});
+
+// Envoyer un message
+app.post('/api/whatsapp/send', authenticate, messageLimiter, async (req, res) => {
+  const { deviceId, to, message } = req.body;
+  if (!deviceId || !to || !message) return res.status(400).json({ error: 'deviceId, to et message requis' });
+  const { data: device, error } = await supabase.from('whatsapp_devices').select('id, status').eq('id', deviceId).eq('user_id', req.user.user_id).single();
+  if (error || !device || device.status !== 'connected') return res.status(400).json({ error: 'Appareil non connecté' });
+  const quota = await checkMessageQuota(req.user.user_id);
+  if (!quota.allowed) return res.status(402).json({ error: quota.reason });
   const waService = whatsappInstances.get(deviceId);
-  if (!waService || !waService.isReady) return res.status(503).json({ error: 'WhatsApp session not ready' });
+  if (!waService || !waService.isReady) return res.status(503).json({ error: 'WhatsApp non prêt' });
   try {
-    let result;
-    if (type === 'media' && mediaUrl) {
-      result = await waService.sendMedia(to, mediaUrl, message);
-    } else {
-      result = await waService.sendMessage(to, message);
+    const result = await waService.sendMessage(to, message);
+    if (quota.useCredits) {
+      const newCredit = req.user.credit - 1;
+      await supabase.from('users').update({ credit: newCredit }).eq('user_id', req.user.user_id);
     }
-    res.json({ success: true, messageId: result.id.id });
+    res.json({ success: true, messageId: result.id.id, remaining_credit: quota.useCredits ? req.user.credit - 1 : req.user.credit });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 3. Webhook configuration
-app.post('/api/webhook/configure', authenticate, async (req, res) => {
+// Configurer webhook
+app.post('/api/whatsapp/webhook', authenticate, async (req, res) => {
   const { webhookUrl } = req.body;
-  if (!webhookUrl) return res.status(400).json({ error: 'webhookUrl required' });
-  const secret = uuidv4();
-  await pool.query('UPDATE users SET webhook_url = $1, webhook_secret = $2 WHERE id = $3', [webhookUrl, secret, req.user.id]);
+  if (!webhookUrl) return res.status(400).json({ error: 'webhookUrl requis' });
+  const secret = crypto.randomBytes(20).toString('hex');
+  await supabase.from('users').update({ webhook_url: webhookUrl, webhook_secret: secret }).eq('user_id', req.user.user_id);
   res.json({ success: true, webhookSecret: secret });
 });
 
-// 4. Subscription (Stripe)
-app.post('/api/subscription/create', authenticate, async (req, res) => {
-  const { planId, paymentMethodId } = req.body;
-  const plans = {
-    basic: { name: 'Basic', price: 29, maxDevices: 1, stripePriceId: process.env.STRIPE_PRICE_BASIC },
-    pro: { name: 'Pro', price: 99, maxDevices: 5, stripePriceId: process.env.STRIPE_PRICE_PRO },
-    enterprise: { name: 'Enterprise', price: 299, maxDevices: 20, stripePriceId: process.env.STRIPE_PRICE_ENTERPRISE }
-  };
-  const plan = plans[planId];
-  if (!plan) return res.status(400).json({ error: 'Invalid plan' });
-  
-  let customerId = req.user.stripe_customer_id;
-  if (!customerId) {
-    const customer = await stripe.customers.create({ email: req.user.email, payment_method: paymentMethodId });
-    customerId = customer.id;
-    await pool.query('UPDATE users SET stripe_customer_id = $1 WHERE id = $2', [customerId, req.user.id]);
-  }
-  const subscription = await stripe.subscriptions.create({
-    customer: customerId,
-    items: [{ price: plan.stripePriceId }],
-    trial_period_days: planId === 'basic' ? 7 : 0
-  });
-  const endDate = new Date();
-  endDate.setDate(endDate.getDate() + 30);
-  await pool.query(
-    `INSERT INTO subscriptions (user_id, plan, price, stripe_subscription_id, status, start_date, end_date)
-     VALUES ($1, $2, $3, $4, $5, NOW(), $6)`,
-    [req.user.id, planId, plan.price, subscription.id, 'active', endDate]
-  );
-  await pool.query('UPDATE users SET subscription_status = $1, max_devices = $2, subscription_ends_at = $3 WHERE id = $4',
-    ['active', plan.maxDevices, endDate, req.user.id]);
-  res.json({ success: true, plan: planId, endDate });
+// Déconnecter un appareil
+app.delete('/api/whatsapp/devices/:deviceId', authenticate, async (req, res) => {
+  const { data: device } = await supabase.from('whatsapp_devices').select('id').eq('id', req.params.deviceId).eq('user_id', req.user.user_id).single();
+  if (!device) return res.status(404).json({ error: 'Appareil non trouvé' });
+  const waService = whatsappInstances.get(req.params.deviceId);
+  if (waService && waService.client) await waService.client.destroy();
+  whatsappInstances.delete(req.params.deviceId);
+  await supabase.from('whatsapp_devices').update({ status: 'disconnected', qr_code: null }).eq('id', req.params.deviceId);
+  res.json({ success: true });
 });
 
-app.get('/api/subscription/status', authenticate, async (req, res) => {
-  const user = req.user;
-  const remainingDays = user.subscription_ends_at
-    ? Math.max(0, Math.ceil((new Date(user.subscription_ends_at) - new Date()) / (1000 * 60 * 60 * 24)))
-    : 0;
-  res.json({
-    status: user.subscription_status,
-    maxDevices: user.max_devices,
-    trialEndsAt: user.trial_ends_at,
-    subscriptionEndsAt: user.subscription_ends_at,
-    daysLeft: remainingDays
+// ============ DÉMARRAGE ============
+initDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Serveur PALGA TOOLS + WhatsApp démarré sur http://localhost:${PORT}`);
+    console.log(`📡 API disponible`);
   });
-});
-
-// 5. Admin (statistiques simples)
-app.get('/api/admin/stats', authenticate, async (req, res) => {
-  if (req.user.email !== process.env.ADMIN_EMAIL) return res.status(403).json({ error: 'Admin only' });
-  const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
-  const activeSubs = await pool.query("SELECT COUNT(*) FROM users WHERE subscription_status = 'active'");
-  const connectedDevices = await pool.query("SELECT COUNT(*) FROM devices WHERE status = 'connected'");
-  const messagesToday = await pool.query("SELECT COUNT(*) FROM message_logs WHERE created_at::date = NOW()::date");
-  res.json({
-    totalUsers: parseInt(totalUsers.rows[0].count),
-    activeSubscriptions: parseInt(activeSubs.rows[0].count),
-    connectedDevices: parseInt(connectedDevices.rows[0].count),
-    messagesToday: parseInt(messagesToday.rows[0].count)
-  });
-});
-
-// 6. Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
-
-// ========== WORKER POUR WEBHOOKS (exécuté en arrière-plan) ==========
-const startWebhookWorker = async () => {
-  while (true) {
-    try {
-      const data = await redis.brpop('webhook_queue', 0);
-      if (data) {
-        const webhookData = JSON.parse(data[1]);
-        await processWebhookWithRetry(webhookData);
-      }
-    } catch (err) {
-      console.error('Worker error', err);
-    }
-  }
-};
-
-const processWebhookWithRetry = async (data) => {
-  const result = await pool.query('SELECT webhook_url, webhook_secret FROM users WHERE id = $1', [data.userId]);
-  const user = result.rows[0];
-  if (user && user.webhook_url) {
-    try {
-      const signature = jwt.sign(data, user.webhook_secret);
-      await axios.post(user.webhook_url, data, { headers: { 'X-Webhook-Signature': signature }, timeout: 5000 });
-    } catch (err) {
-      console.log(`Webhook retry scheduled for ${data.messageId}`);
-      await redis.lpush('webhook_retry', JSON.stringify({ ...data, retry: (data.retry || 0) + 1 }));
-      if ((data.retry || 0) < 3) {
-        setTimeout(() => processWebhookWithRetry(data), 5000 * (data.retry + 1));
-      }
-    }
-  }
-};
-
-// Lancer le worker
-if (process.env.NODE_ENV !== 'test') {
-  startWebhookWorker();
-}
-
-// ========== DÉMARRAGE ==========
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+}).catch(err => {
+  console.error('Erreur au démarrage:', err);
+  app.listen(PORT, () => console.log(`Serveur démarré sur port ${PORT}`));
 });
